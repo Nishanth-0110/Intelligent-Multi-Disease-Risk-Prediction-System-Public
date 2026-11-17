@@ -127,6 +127,10 @@ models/embeddings/
 !models/ml/.gitkeep
 !models/dl/.gitkeep
 
+# Whitelist production inference artifacts (required by app/API engine)
+!week7_artifacts/*.pkl
+!week7_artifacts/*.pt
+
 # ===========================================
 # Logs
 # ===========================================

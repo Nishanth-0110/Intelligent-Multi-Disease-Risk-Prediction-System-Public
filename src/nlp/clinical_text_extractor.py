@@ -8,7 +8,7 @@ Extracts lifestyle and history features from patient-provided text using:
 
 import re
 import json
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 
 # NOTE: Install required packages
@@ -57,14 +57,20 @@ class ClinicalTextExtractor:
         self.smoking_patterns = {
             'current': [
                 r'i\s+smoke',
+                r'(i\s+am|i\'m)\s+a\s+smoker',
                 r'smoking\s+(\d+)',
                 r'(\d+)\s*(cigarettes?|packs?)',
-                r'current\s+smoker'
+                r'(a|one)\s+packs?\s+(a|per)\s+day',
+                r'smok(ing|es?)\s+(about\s+)?(a|one|\d+)\s+packs?',
+                r'current\s+smoker',
+                r'\b(smoker|smokes|smoking)\b'
             ],
             'former': [
-                r'(quit|stopped)\s+(smoking|cigarettes?)',
+                r'(quit|stopped|gave\s+up)\s+(smoking|cigarettes?|tobacco)',
+                r'used\s+to\s+smok',
                 r'former\s+smoker',
-                r'ex-?smoker'
+                r'ex-?smoker',
+                r'smok(ed|ing)?\s+(until|till)\s+\d+'
             ],
             'never': [
                 r'non-?smoker',
@@ -78,16 +84,23 @@ class ClinicalTextExtractor:
             'heavy': [
                 r'(\d+)[+-]?\s*(beers?|drinks?|glasses?)\s+(daily|per\s+day|every\s+day)',
                 r'heavy\s+drink',
+                r'drinks?\s+(daily|every\s+day|heavily|a\s+lot|too\s+much)',
+                r'drinks?\s+heavily',
                 r'alcoholic'
             ],
             'regular': [
                 r'drink\s+alcohol\s+(regularly|often)',
+                r'drinks?\s+(regularly|often|most\s+(days?|nights?))',
                 r'(social|regular)\s+drink'
             ],
             'occasional': [
                 r'(occasional|sometimes)\s+drink',
+                r'drinks?\s+(on|during|at|over|only\s+on)\s+(the\s+)?weekends?',
+                r'(\d+)[-–]?\s*\d*\s*(beers?|drinks?|glasses?)\s+(on|during|at)\s+(the\s+)?weekends?',
+                r'weekend\s+drink',
                 r'weekends?\s+only',
-                r'socially'
+                r'socially',
+                r'drinks?\s+occasionally'
             ],
             'never': [
                 r'don\'t\s+drink',
@@ -102,7 +115,12 @@ class ClinicalTextExtractor:
                 r'sedentary',
                 r'no\s+exercise',
                 r'desk\s+job',
-                r'rarely\s+exercise'
+                r'desk[-\s]?based',
+                r'rarely\s+exercise',
+                r'exercise\s+rarely',
+                r'barely\s+exercise',
+                r'(don\'t|do\s+not)\s+exercise',
+                r'no\s+physical\s+activity'
             ],
             'moderate': [
                 r'exercise\s+(\d+)\s+times\s+weekly',
@@ -167,17 +185,21 @@ class ClinicalTextExtractor:
         # Extract smoking frequency if current smoker
         if features.smoking_status == "current":
             features.smoking_frequency = self._extract_smoking_frequency(text_lower)
+            if features.smoking_frequency is None and re.search(r'(a|one)\s+pack\s+(a|per)\s+day', text_lower):
+                features.smoking_frequency = "1 pack/day"
         
         # Extract alcohol frequency if drinker
-        if features.alcohol_status in ["regular", "heavy"]:
+        if features.alcohol_status in ["occasional", "regular", "heavy"]:
             features.alcohol_frequency = self._extract_alcohol_frequency(text_lower)
+            if features.alcohol_frequency is None and re.search(r'weekends?', text_lower):
+                features.alcohol_frequency = "weekends"
         
         return features
     
     def _extract_smoking(self, text: str) -> str:
-        """Extract smoking status"""
-        for status, patterns in self.smoking_patterns.items():
-            for pattern in patterns:
+        """Extract smoking status — never/former take precedence over current."""
+        for status in ("never", "former", "current"):
+            for pattern in self.smoking_patterns.get(status, []):
                 if re.search(pattern, text, re.IGNORECASE):
                     return status
         return "unknown"
@@ -191,9 +213,9 @@ class ClinicalTextExtractor:
         return None
     
     def _extract_alcohol(self, text: str) -> str:
-        """Extract alcohol consumption status"""
-        for status, patterns in self.alcohol_patterns.items():
-            for pattern in patterns:
+        """Extract alcohol status — never/heavy take precedence (more specific first)."""
+        for status in ("never", "heavy", "regular", "occasional"):
+            for pattern in self.alcohol_patterns.get(status, []):
                 if re.search(pattern, text, re.IGNORECASE):
                     return status
         return "unknown"
@@ -237,8 +259,9 @@ class ClinicalTextExtractor:
             'fatigue': ['fatigue', 'tired', 'exhausted'],
             'shortness_of_breath': ['shortness of breath', 'breathless'],
             'weight_loss': ['weight loss', 'losing weight'],
-            'frequent_urination': ['frequent urination', 'polyuria'],
-            'excessive_thirst': ['excessive thirst', 'polydipsia'],
+            'frequent_urination': ['frequent urination', 'polyuria', 'urinate frequently',
+                                   'urinating frequently', 'urinate a lot', 'urinate at night'],
+            'excessive_thirst': ['excessive thirst', 'polydipsia', 'thirsty', 'very thirsty'],
             'jaundice': ['yellow', 'jaundice'],
             'edema': ['swelling', 'edema']
         }
@@ -268,6 +291,72 @@ class ClinicalTextExtractor:
             'family_history_kidney': 1 if 'chronic_kidney_disease' in features.family_history else 0,
             'family_history_liver': 1 if 'liver_disease' in features.family_history else 0
         }
+
+
+def clinical_context_notes(features: "LifestyleFeatures") -> List[Dict[str, Any]]:
+    """Map extracted lifestyle factors to conservative clinical context notes.
+
+    These are rule-based heuristics shown alongside model scores — they flag
+    known risk factors that are NOT among the model's 24 features, so the
+    affected score may be conservative. Not diagnostic.
+
+    Returns list of {"factor": str, "targets": [disease targets], "note": str}.
+    """
+    notes: List[Dict[str, Any]] = []
+    if features is None:
+        return notes
+
+    if features.smoking_status == "current":
+        notes.append({
+            "factor": "smoking (current)",
+            "targets": ["heart_disease_risk", "kidney_disease_risk"],
+            "note": "Smoking damages blood vessels and raises heart and kidney risk — "
+                    "quitting is one of the most effective steps to protect both.",
+        })
+    elif features.smoking_status == "former":
+        notes.append({
+            "factor": "smoking (former)",
+            "targets": ["heart_disease_risk"],
+            "note": "Past smoking still leaves some heart risk — staying tobacco-free "
+                    "keeps protecting you.",
+        })
+
+    if features.alcohol_status in ("regular", "heavy"):
+        notes.append({
+            "factor": f"alcohol ({features.alcohol_status})",
+            "targets": ["liver_disease_risk", "heart_disease_risk"],
+            "note": "Regular alcohol use strains the liver and raises blood pressure — "
+                    "cutting down protects both liver and heart.",
+        })
+
+    if features.physical_activity == "sedentary":
+        notes.append({
+            "factor": "sedentary lifestyle",
+            "targets": ["diabetes_risk", "heart_disease_risk"],
+            "note": "Low physical activity raises blood sugar and heart risk — "
+                    "even 30 minutes of daily walking helps.",
+        })
+
+    fam = set(features.family_history or [])
+    fam_map = {
+        "diabetes": ("diabetes_risk", "family history of diabetes",
+                     "Family history of diabetes raises your personal risk — periodic "
+                     "blood sugar checks are recommended."),
+        "cardiovascular_disease": ("heart_disease_risk", "family history of cardiovascular disease",
+                                   "Family history of heart disease raises your personal risk — "
+                                   "keep BP and cholesterol monitored regularly."),
+        "chronic_kidney_disease": ("kidney_disease_risk", "family history of kidney disease",
+                                   "Family history of kidney disease raises your personal risk — "
+                                   "periodic kidney function tests are wise."),
+        "liver_disease": ("liver_disease_risk", "family history of liver disease",
+                          "Family history of liver disease raises your personal risk — "
+                          "periodic liver function tests are wise."),
+    }
+    for key, (target, label, note) in fam_map.items():
+        if key in fam:
+            notes.append({"factor": label, "targets": [target], "note": note})
+
+    return notes
 
 
 # Example usage
